@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# claude-caffeinate — keep macOS awake during Claude Code sessions
+# Uses caffeinate -i -w <pid> so cleanup is automatic on crash/exit.
+# All errors exit 0 to never block Claude hooks.
+
+set -euo pipefail
+
+STATE_DIR="/tmp/claude-caffeinate/sessions"
+
+die_silent() { exit 0; }
+trap 'die_silent' ERR
+
+# Skip silently on non-macOS or missing caffeinate
+command -v caffeinate >/dev/null 2>&1 || exit 0
+
+mkdir -p "$STATE_DIR"
+
+# Read session_id from hook stdin (JSON with session_id field).
+# Called once; result stored in HOOK_SESSION_ID.
+HOOK_SESSION_ID=""
+read_session_id() {
+    local input
+    input=$(cat 2>/dev/null) || true
+    if [ -n "$input" ]; then
+        # Extract session_id from JSON without requiring jq
+        HOOK_SESSION_ID=$(echo "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null) || true
+    fi
+}
+
+# Walk process tree upward from $$ looking for a Claude Code ancestor.
+# Returns the PID of the claude process, or falls back to grandparent.
+find_claude_pid() {
+    local pid=$$
+    local max_depth=20
+    local depth=0
+
+    while [ "$pid" -gt 1 ] && [ "$depth" -lt "$max_depth" ]; do
+        local ppid
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
+        [ -z "$ppid" ] || [ "$ppid" -le 1 ] && break
+
+        local cmd
+        cmd=$(ps -o args= -p "$ppid" 2>/dev/null) || break
+        if echo "$cmd" | grep -qi "claude"; then
+            echo "$ppid"
+            return 0
+        fi
+
+        pid=$ppid
+        depth=$((depth + 1))
+    done
+
+    # Fallback: grandparent of this script
+    local parent
+    parent=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ') || { echo $$; return 0; }
+    local grandparent
+    grandparent=$(ps -o ppid= -p "$parent" 2>/dev/null | tr -d ' ') || { echo "$parent"; return 0; }
+    [ -z "$grandparent" ] || [ "$grandparent" -le 1 ] && { echo "$parent"; return 0; }
+    echo "$grandparent"
+}
+
+cmd_acquire() {
+    read_session_id
+    sweep_stale
+    local session_id="${HOOK_SESSION_ID:-unknown-$$}"
+    local session_file="$STATE_DIR/$session_id"
+
+    # If session already exists (resume/compact), kill old caffeinate first
+    if [ -f "$session_file" ]; then
+        local old_caf_pid
+        old_caf_pid=$(grep '^caffeinate_pid=' "$session_file" 2>/dev/null | cut -d= -f2)
+        if [ -n "$old_caf_pid" ]; then
+            kill "$old_caf_pid" 2>/dev/null || true
+        fi
+        rm -f "$session_file"
+    fi
+
+    local claude_pid
+    claude_pid=$(find_claude_pid)
+
+    # Verify the PID is actually alive
+    if ! kill -0 "$claude_pid" 2>/dev/null; then
+        exit 0
+    fi
+
+    # Spawn caffeinate fully detached so the hook doesn't wait for it
+    caffeinate -i -w "$claude_pid" </dev/null &>/dev/null &
+    local caf_pid=$!
+    disown "$caf_pid" 2>/dev/null || true
+
+    # Verify caffeinate started
+    if ! kill -0 "$caf_pid" 2>/dev/null; then
+        exit 0
+    fi
+
+    # Record session
+    cat > "$session_file" <<EOF
+claude_pid=$claude_pid
+caffeinate_pid=$caf_pid
+EOF
+}
+
+cmd_release() {
+    read_session_id
+    sweep_stale
+    local session_id="${HOOK_SESSION_ID:-unknown-$$}"
+    local session_file="$STATE_DIR/$session_id"
+
+    if [ -f "$session_file" ]; then
+        local caf_pid
+        caf_pid=$(grep '^caffeinate_pid=' "$session_file" 2>/dev/null | cut -d= -f2)
+        if [ -n "$caf_pid" ]; then
+            kill "$caf_pid" 2>/dev/null || true
+        fi
+        rm -f "$session_file"
+    fi
+}
+
+# Remove session files whose caffeinate is no longer running.
+# Called opportunistically from acquire/release.
+sweep_stale() {
+    for f in "$STATE_DIR"/*; do
+        [ -f "$f" ] || continue
+        local caf_pid
+        caf_pid=$(grep '^caffeinate_pid=' "$f" 2>/dev/null | cut -d= -f2) || continue
+        if [ -n "$caf_pid" ] && ! kill -0 "$caf_pid" 2>/dev/null; then
+            rm -f "$f"
+        fi
+    done
+}
+
+cmd_status() {
+    sweep_stale
+    local active=0
+
+    for f in "$STATE_DIR"/*; do
+        [ -f "$f" ] || continue
+        local session_id
+        session_id=$(basename "$f")
+        local claude_pid caf_pid
+        claude_pid=$(grep '^claude_pid=' "$f" 2>/dev/null | cut -d= -f2)
+        caf_pid=$(grep '^caffeinate_pid=' "$f" 2>/dev/null | cut -d= -f2)
+
+        if [ -n "$caf_pid" ] && kill -0 "$caf_pid" 2>/dev/null; then
+            echo "  active: session=$session_id claude_pid=$claude_pid caffeinate_pid=$caf_pid"
+            active=$((active + 1))
+        fi
+    done
+
+    echo "$active active session(s)."
+}
+
+case "${1:-status}" in
+    acquire) cmd_acquire ;;
+    release) cmd_release ;;
+    status)  cmd_status ;;
+    *)
+        echo "Usage: claude-caffeinate {acquire|release|status}"
+        exit 1
+        ;;
+esac
